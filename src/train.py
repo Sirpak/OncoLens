@@ -53,9 +53,28 @@ def evaluate(model, loader, criterion, device):
             total_correct += (preds == labels).sum().item(); total_seen += labels.size(0)
             y_true.extend(labels.cpu().tolist()); y_pred.extend(preds.cpu().tolist())
     return total_loss / total_seen, total_correct / total_seen, y_true, y_pred
+def resolve_runtime_paths(config: dict, args: argparse.Namespace, environ: dict | None = None) -> tuple[dict, Path, Path]:
+    runtime_env = environ or os.environ
+    sm_training_dir = runtime_env.get("SM_CHANNEL_TRAINING")
+    sm_output_dir = runtime_env.get("SM_OUTPUT_DATA_DIR")
+    sm_model_dir = runtime_env.get("SM_MODEL_DIR")
+
+    if args.dataset_path:
+        config["dataset"]["path"] = args.dataset_path
+    elif sm_training_dir:
+        config["dataset"]["path"] = sm_training_dir
+
+    if args.output_dir:
+        config["training"]["output_dir"] = args.output_dir
+    elif sm_output_dir:
+        config["training"]["output_dir"] = sm_output_dir
+
+    output_dir = Path(config["training"]["output_dir"]).expanduser()
+    model_dir = Path(sm_model_dir).expanduser() if sm_model_dir else output_dir
+    return config, output_dir, model_dir
 
 
-def maybe_upload_to_hub(output_dir: Path, config: dict) -> None:
+def maybe_upload_to_hub(output_dir: Path, model_dir: Path, config: dict) -> None:
     repo_id = config.get("storage", {}).get("hf_repo_id", "").strip()
     if not repo_id:
         return
@@ -64,8 +83,13 @@ def maybe_upload_to_hub(output_dir: Path, config: dict) -> None:
         print("HF upload skipped: token not found."); return
     api = HfApi(token=token)
     api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-    for name in ["best_model.pt", "metrics.json", "config.yaml"]:
-        path = output_dir / name
+    artifact_locations = {
+        "best_model.pt": model_dir,
+        "metrics.json": output_dir,
+        "config.yaml": output_dir,
+    }
+    for name, directory in artifact_locations.items():
+        path = directory / name
         if path.exists():
             api.upload_file(path_or_fileobj=str(path), path_in_repo=name, repo_id=repo_id, repo_type="model")
 
@@ -78,14 +102,11 @@ def main() -> None:
     args = parser.parse_args()
 
     config = load_config(args.config)
-    if args.dataset_path:
-        config["dataset"]["path"] = args.dataset_path
-    if args.output_dir:
-        config["training"]["output_dir"] = args.output_dir
+    config, output_dir, model_dir = resolve_runtime_paths(config, args)
 
     set_seed(int(config["project"]["seed"]))
-    output_dir = Path(config["training"]["output_dir"]).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    model_dir.mkdir(parents=True, exist_ok=True)
     with open(output_dir / "config.yaml", "w", encoding="utf-8") as handle:
         yaml.safe_dump(config, handle, sort_keys=False)
 
@@ -116,7 +137,7 @@ def main() -> None:
                     "image_size": int(config["dataset"]["image_size"]),
                     "config": config,
                 },
-                output_dir / "best_model.pt",
+                model_dir / "best_model.pt",
             )
 
     metrics = {
@@ -134,7 +155,7 @@ def main() -> None:
     }
     with open(output_dir / "metrics.json", "w", encoding="utf-8") as handle:
         json.dump(metrics, handle, indent=2)
-    maybe_upload_to_hub(output_dir, config)
+    maybe_upload_to_hub(output_dir, model_dir, config)
 
 
 if __name__ == "__main__":
